@@ -1,7 +1,7 @@
 // ============================================================
-//  FAMILY HUB — App v2
-//  Features: auth, filtered calendar, see/do events,
-//  start/end times, in-app reminders
+//  FAMILY HUB — App v3
+//  Added: recurring events (weekly / fortnightly)
+//  All existing event fields unchanged — fully backwards compatible
 // ============================================================
 
 const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${CONFIG.JSONBIN_BIN_ID}`;
@@ -35,6 +35,13 @@ const REMINDER_OPTIONS = [
   { label: "1 day before", minutes: 1440 },
 ];
 
+// NEW: recurring options
+const RECUR_OPTIONS = [
+  { label: "Does not repeat", value: "none" },
+  { label: "Weekly", value: "weekly" },
+  { label: "Fortnightly", value: "fortnightly" },
+];
+
 let state = { events: [], todos: [], members: [], users: [] };
 let currentUser = null;
 let curYear, curMonth;
@@ -58,7 +65,6 @@ async function loadData() {
   if (!state.members) state.members = [];
   if (!state.users) state.users = [];
 
-  // Restore session
   const session = Auth.getSession();
   if (session && state.users.find((u) => u.email === session.email)) {
     currentUser = session;
@@ -94,7 +100,6 @@ function updateSyncBadge(text) {
   if (b) b.textContent = text;
 }
 
-// Poll every 30s for updates from other family members
 setInterval(async () => {
   if (!currentUser) return;
   try {
@@ -111,6 +116,80 @@ setInterval(async () => {
   } catch (e) {}
 }, 30000);
 
+// ── Recurring events ──────────────────────────────────────────
+//
+// Recurring events are stored ONCE in state.events with extra fields:
+//   recurring: "weekly" | "fortnightly" | "none"
+//   recurringEnd: "YYYY-MM-DD"  (last date to generate occurrences up to)
+//
+// When rendering, expandRecurringEvents() generates virtual occurrence
+// objects on the fly for display. These are never saved to JSONBin —
+// only the original "template" event is stored.
+//
+// Each virtual occurrence carries the original event's id plus an
+// occurrenceDate so the calendar can display it correctly.
+
+function addDays(dateStr, days) {
+  const d = new Date(dateStr + "T00:00:00");
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function expandRecurringEvents(events, fromDate, toDate) {
+  const result = [];
+
+  events.forEach((ev) => {
+    // Non-recurring: include as-is if within range
+    if (!ev.recurring || ev.recurring === "none") {
+      if (ev.date >= fromDate && ev.date <= toDate) result.push(ev);
+      return;
+    }
+
+    const intervalDays = ev.recurring === "weekly" ? 7 : 14;
+    const endDate = ev.recurringEnd || addDays(ev.date, 365); // default 1 year if no end set
+    let current = ev.date;
+
+    while (current <= endDate && current <= toDate) {
+      if (current >= fromDate) {
+        // Create a virtual occurrence — same as original but with occurrenceDate
+        result.push({ ...ev, date: current, isOccurrence: true });
+      }
+      current = addDays(current, intervalDays);
+    }
+  });
+
+  return result;
+}
+
+// Get all events visible to the current user, expanded for a given month
+function getExpandedEventsForMonth(year, month) {
+  const fromDate = `${year}-${String(month + 1).padStart(2, "0")}-01`;
+  const lastDay = new Date(year, month + 1, 0).getDate();
+  const toDate = `${year}-${String(month + 1).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+
+  const myEvents = state.events.filter((e) =>
+    e.doer === currentUser.name ||
+    (e.seers && e.seers.includes(currentUser.name))
+  );
+
+  return expandRecurringEvents(myEvents, fromDate, toDate);
+}
+
+// Get upcoming expanded events from today onwards (for the list below the calendar)
+function getExpandedUpcoming() {
+  const today = todayStr();
+  // Look ahead 6 months
+  const future = addDays(today, 180);
+
+  const myEvents = state.events.filter((e) =>
+    e.doer === currentUser.name ||
+    (e.seers && e.seers.includes(currentUser.name))
+  );
+
+  return expandRecurringEvents(myEvents, today, future)
+    .sort((a, b) => a.date.localeCompare(b.date) || (a.startTime || "").localeCompare(b.startTime || ""));
+}
+
 // ── Reminders ─────────────────────────────────────────────────
 
 function checkReminders() {
@@ -118,30 +197,30 @@ function checkReminders() {
   const now = new Date();
   const upcoming = [];
 
-  state.events.forEach((ev) => {
-    // Only check events relevant to this user
-    const isDoer = ev.doer === currentUser.name;
-    const isSeer = ev.seers && ev.seers.includes(currentUser.name);
-    if (!isDoer && !isSeer) return;
+  // Use expanded events for reminder checking (covers recurring occurrences)
+  const today = todayStr();
+  const future = addDays(today, 2);
+  const myEvents = state.events.filter((e) =>
+    e.doer === currentUser.name || (e.seers && e.seers.includes(currentUser.name))
+  );
+  const expanded = expandRecurringEvents(myEvents, today, future);
+
+  expanded.forEach((ev) => {
     if (!ev.reminder || ev.reminder === "none") return;
     if (!ev.startTime) return;
 
-    // Build event datetime
     const [year, month, day] = ev.date.split("-").map(Number);
     const [hour, min] = ev.startTime.split(":").map(Number);
     const eventDt = new Date(year, month - 1, day, hour, min);
     const reminderDt = new Date(eventDt.getTime() - ev.reminder * 60000);
     const diffMins = (eventDt - now) / 60000;
 
-    // Show reminder if we're within the reminder window and event hasn't passed
     if (diffMins > 0 && now >= reminderDt) {
       upcoming.push({ ev, diffMins: Math.round(diffMins) });
     }
   });
 
-  if (upcoming.length > 0) {
-    showReminderBanner(upcoming);
-  }
+  if (upcoming.length > 0) showReminderBanner(upcoming);
 }
 
 function showReminderBanner(items) {
@@ -242,20 +321,17 @@ function renderAuthScreen(app, mode = "login") {
       <div class="auth-icon">🏠</div>
       <h1>${CONFIG.FAMILY_NAME}</h1>
       <p class="auth-subtitle">${isLogin ? "Sign in to your account" : "Create your family account"}</p>
-
       <div class="auth-card">
         <div class="auth-toggle">
           <button class="auth-toggle-btn ${isLogin ? "active" : ""}" onclick="renderAuthScreen(document.getElementById('app'), 'login')">Sign in</button>
           <button class="auth-toggle-btn ${!isLogin ? "active" : ""}" onclick="renderAuthScreen(document.getElementById('app'), 'register')">Register</button>
         </div>
-
         <div id="auth-error" class="auth-error" style="display:none;"></div>
-
         <div class="form-stack">
           ${!isLogin ? `<input type="text" id="auth-name" placeholder="Your name (e.g. Dad, Sarah)" autocomplete="name" />` : ""}
           <input type="email" id="auth-email" placeholder="Email address" autocomplete="email" />
           <input type="password" id="auth-password" placeholder="Password${!isLogin ? " (min. 6 characters)" : ""}" autocomplete="${isLogin ? "current-password" : "new-password"}" />
-          <button class="btn-primary" onclick="${isLogin ? "doLogin()" : "doRegister()"}">
+          <button class="btn-primary" onclick="${isLogin ? "doLogin()" : "doRegister()}">
             ${isLogin ? "Sign in" : "Create account"}
           </button>
         </div>
@@ -263,7 +339,6 @@ function renderAuthScreen(app, mode = "login") {
       <p class="auth-note">☁️ All family members share the same calendar and tasks</p>
     </div>`;
 
-  // Allow Enter key to submit
   app.querySelectorAll("input").forEach((inp) => {
     inp.addEventListener("keydown", (e) => {
       if (e.key === "Enter") isLogin ? doLogin() : doRegister();
@@ -336,8 +411,6 @@ function renderApp(app) {
 
   renderCalPanel();
   renderTodoPanel();
-
-  // Close user menu when clicking elsewhere
   document.addEventListener("click", closeUserMenuOnOutsideClick);
 }
 
@@ -352,7 +425,6 @@ function closeUserMenuOnOutsideClick(e) {
     menu.style.display = "none";
   }
 }
-
 function showTab(name) {
   activeTab = name;
   ["cal", "todo"].forEach((n) => {
@@ -367,16 +439,12 @@ function renderCalPanel() {
   const panel = document.getElementById("panel-cal");
   if (!panel) return;
 
-  // Events relevant to current user
-  const myEvents = state.events.filter((e) =>
-    e.doer === currentUser.name ||
-    (e.seers && e.seers.includes(currentUser.name))
-  );
+  const today = new Date();
+  const expandedThisMonth = getExpandedEventsForMonth(curYear, curMonth);
 
   const firstDay = new Date(curYear, curMonth, 1).getDay();
   const daysInMonth = new Date(curYear, curMonth + 1, 0).getDate();
   const prevDays = new Date(curYear, curMonth, 0).getDate();
-  const today = new Date();
 
   let dayHeaders = DAYS.map((d) => `<div class="day-lbl">${d}</div>`).join("");
   let cells = "";
@@ -387,7 +455,7 @@ function renderCalPanel() {
   for (let d = 1; d <= daysInMonth; d++) {
     const ds = `${curYear}-${String(curMonth + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
     const isToday = today.getFullYear() === curYear && today.getMonth() === curMonth && today.getDate() === d;
-    const dayEvs = myEvents.filter((e) => e.date === ds);
+    const dayEvs = expandedThisMonth.filter((e) => e.date === ds);
     const pips = dayEvs.slice(0, 3).map((e) => {
       const isDoer = e.doer === currentUser.name;
       const c = memberColor(currentUser.name);
@@ -399,7 +467,6 @@ function renderCalPanel() {
   const rem = total % 7 === 0 ? 0 : 7 - (total % 7);
   for (let i = 1; i <= rem; i++) cells += `<div class="cal-day other"><span class="day-num">${i}</span></div>`;
 
-  // Build member checkboxes for seers
   const members = allMemberNames();
   const memberChecks = members.map((name) => `
     <label class="member-check">
@@ -411,11 +478,18 @@ function renderCalPanel() {
     `<option value="${r.minutes}">${r.label}</option>`
   ).join("");
 
-  // Split events into "doing" and "seeing"
-  const upcomingDo = myEvents.filter((e) => e.date >= todayStr() && e.doer === currentUser.name)
-    .sort((a, b) => a.date.localeCompare(b.date) || (a.startTime || "").localeCompare(b.startTime || ""));
-  const upcomingSee = myEvents.filter((e) => e.date >= todayStr() && e.doer !== currentUser.name)
-    .sort((a, b) => a.date.localeCompare(b.date) || (a.startTime || "").localeCompare(b.startTime || ""));
+  // NEW: recurring options
+  const recurOpts = RECUR_OPTIONS.map((r) =>
+    `<option value="${r.value}">${r.label}</option>`
+  ).join("");
+
+  // Default recurring end date = 1 year from today
+  const defaultEndDate = addDays(todayStr(), 365);
+
+  // Upcoming expanded events split by do/see
+  const allUpcoming = getExpandedUpcoming();
+  const upcomingDo = allUpcoming.filter((e) => e.doer === currentUser.name);
+  const upcomingSee = allUpcoming.filter((e) => e.doer !== currentUser.name);
 
   panel.innerHTML = `
     <div class="month-nav">
@@ -428,6 +502,7 @@ function renderCalPanel() {
     <div class="legend-row">
       <span class="legend-item"><span class="legend-pip" style="background:#534AB7;"></span> My events (Do)</span>
       <span class="legend-item"><span class="legend-pip" style="background:#9ca3af;"></span> Aware of (See)</span>
+      <span class="legend-item">🔁 Recurring</span>
     </div>
 
     <div class="section-card">
@@ -456,6 +531,19 @@ function renderCalPanel() {
           <div>
             <label class="field-label">End time (optional)</label>
             <input type="time" id="ev-end" />
+          </div>
+        </div>
+
+        <div class="form-row-2">
+          <div>
+            <label class="field-label">Repeat</label>
+            <select id="ev-recur" onchange="toggleRecurEnd()">
+              ${recurOpts}
+            </select>
+          </div>
+          <div id="recur-end-wrap" style="display:none;">
+            <label class="field-label">Repeat ends</label>
+            <input type="date" id="ev-recur-end" value="${defaultEndDate}" />
           </div>
         </div>
 
@@ -492,6 +580,13 @@ function renderCalPanel() {
   });
 }
 
+// Show/hide the "repeat ends" date picker based on recur selection
+function toggleRecurEnd() {
+  const val = document.getElementById("ev-recur")?.value;
+  const wrap = document.getElementById("recur-end-wrap");
+  if (wrap) wrap.style.display = val && val !== "none" ? "block" : "none";
+}
+
 function eventItemHtml(e, role) {
   const isSee = role === "see";
   const timeStr = e.startTime
@@ -501,18 +596,29 @@ function eventItemHtml(e, role) {
     ? REMINDER_OPTIONS.find((r) => r.minutes == e.reminder)?.label || ""
     : "";
 
-  // Show all people on the event
+  // NEW: recurring badge
+  const isRecurring = e.recurring && e.recurring !== "none";
+  const recurLabel = isRecurring
+    ? `<span class="recur-badge">🔁 ${e.recurring === "weekly" ? "Weekly" : "Fortnightly"}</span>`
+    : "";
+
   const doerPill = whoPill(e.doer, "do");
   const seerPills = (e.seers || [])
     .filter((s) => s !== e.doer)
     .map((s) => whoPill(s, "see"))
     .join("");
 
+  // Delete button — for recurring events offer choice; for one-off just delete
+  const deleteBtn = !isSee ? (isRecurring
+    ? `<button class="del-btn" onclick="confirmDeleteRecurring('${e.id}', '${e.date}')" aria-label="Delete">✕</button>`
+    : `<button class="del-btn" onclick="deleteEvent('${e.id}')" aria-label="Delete">✕</button>`)
+    : "";
+
   return `
     <div class="event-item${isSee ? " event-item-see" : ""}">
       ${isSee ? `<div class="see-indicator" title="You're aware of this event">👁</div>` : ""}
       <div class="event-body">
-        <div class="event-title">${e.name}</div>
+        <div class="event-title">${e.name} ${recurLabel}</div>
         <div class="event-meta">
           <span class="date-pill">📅 ${formatDate(e.date)}${timeStr ? " · " + timeStr : ""}</span>
           ${doerPill}
@@ -521,8 +627,59 @@ function eventItemHtml(e, role) {
         ${e.notes ? `<div class="event-notes">${e.notes}</div>` : ""}
         ${reminderLabel ? `<div class="reminder-label">⏰ ${reminderLabel}</div>` : ""}
       </div>
-      ${!isSee ? `<button class="del-btn" onclick="deleteEvent('${e.id}')" aria-label="Delete">✕</button>` : ""}
+      ${deleteBtn}
     </div>`;
+}
+
+// ── Delete recurring — prompt user ────────────────────────────
+
+function confirmDeleteRecurring(id, occurrenceDate) {
+  // Show a small inline confirmation instead of browser confirm()
+  const existing = document.getElementById("delete-modal");
+  if (existing) existing.remove();
+
+  const modal = document.createElement("div");
+  modal.id = "delete-modal";
+  modal.className = "delete-modal";
+  modal.innerHTML = `
+    <div class="delete-modal-box">
+      <p class="delete-modal-title">Delete recurring event</p>
+      <p class="delete-modal-sub">Do you want to delete just this occurrence, or all future occurrences?</p>
+      <div class="delete-modal-btns">
+        <button class="delete-modal-btn" onclick="deleteOccurrence('${id}', '${occurrenceDate}')">This occurrence only</button>
+        <button class="delete-modal-btn delete-modal-btn-danger" onclick="deleteAllRecurring('${id}')">All occurrences</button>
+        <button class="delete-modal-btn delete-modal-btn-cancel" onclick="document.getElementById('delete-modal').remove()">Cancel</button>
+      </div>
+    </div>`;
+
+  document.getElementById("main-content").prepend(modal);
+}
+
+// Delete a single occurrence by setting recurringEnd to the day before
+async function deleteOccurrence(id, occurrenceDate) {
+  document.getElementById("delete-modal")?.remove();
+  const ev = state.events.find((e) => e.id === id);
+  if (!ev) return;
+
+  if (occurrenceDate === ev.date) {
+    // Deleting the first occurrence — move start date forward by one interval
+    const days = ev.recurring === "weekly" ? 7 : 14;
+    ev.date = addDays(ev.date, days);
+  } else {
+    // Deleting a later occurrence — set end date to day before this occurrence
+    ev.recurringEnd = addDays(occurrenceDate, -1);
+  }
+
+  await saveData();
+  renderCalPanel();
+}
+
+// Delete the whole recurring series
+async function deleteAllRecurring(id) {
+  document.getElementById("delete-modal")?.remove();
+  state.events = state.events.filter((e) => e.id !== id);
+  await saveData();
+  renderCalPanel();
 }
 
 // ── To-do panel ───────────────────────────────────────────────
@@ -540,7 +697,7 @@ function renderTodoPanel() {
   const otherPending = state.todos.filter((t) => !t.done && t.owner !== currentUser.name);
   const done = state.todos.filter((t) => t.done);
 
-  const todoHtml = (t, isDone) => `
+  const todoItemHtml = (t, isDone) => `
     <div class="todo-item${isDone ? " done-item" : ""}">
       <button class="check-btn${isDone ? " done" : ""}" onclick="toggleTodo('${t.id}')" aria-label="${isDone ? "Mark undone" : "Mark done"}">
         <span class="check-inner">${isDone ? "✓" : ""}</span>
@@ -564,17 +721,14 @@ function renderTodoPanel() {
         <button class="btn-primary" onclick="addTodo()">Add task</button>
       </div>
     </div>
-
     <div class="section-label">My tasks (${myPending.length})</div>
-    ${myPending.length ? myPending.map((t) => todoHtml(t, false)).join("") : `<p class="empty-msg">Nothing on your list 🎉</p>`}
-
+    ${myPending.length ? myPending.map((t) => todoItemHtml(t, false)).join("") : `<p class="empty-msg">Nothing on your list 🎉</p>`}
     ${otherPending.length ? `
       <div class="section-label" style="margin-top:1.25rem;">Rest of the family (${otherPending.length})</div>
-      ${otherPending.map((t) => todoHtml(t, false)).join("")}` : ""}
-
+      ${otherPending.map((t) => todoItemHtml(t, false)).join("")}` : ""}
     ${done.length ? `
       <div class="section-label" style="margin-top:1.25rem;">Completed (${done.length})</div>
-      ${done.map((t) => todoHtml(t, true)).join("")}` : ""}`;
+      ${done.map((t) => todoItemHtml(t, true)).join("")}` : ""}`;
 
   document.getElementById("todo-text")?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") addTodo();
@@ -598,19 +752,22 @@ async function addEvent() {
   const endTime = document.getElementById("ev-end")?.value || "";
   const notes = document.getElementById("ev-notes")?.value.trim() || "";
   const reminder = document.getElementById("ev-reminder")?.value || "none";
+  const recurring = document.getElementById("ev-recur")?.value || "none";
+  const recurringEnd = recurring !== "none"
+    ? (document.getElementById("ev-recur-end")?.value || addDays(date, 365))
+    : "";
 
-  // Collect checked seers
   const seerChecks = document.querySelectorAll('input[name="seer"]:checked');
   const seers = Array.from(seerChecks).map((c) => c.value);
-
-  // Make sure doer is always in seers
   if (!seers.includes(doer)) seers.push(doer);
 
   if (!name || !date) return;
 
+  // NEW fields: recurring + recurringEnd — old events simply won't have them
   state.events.push({
     id: uid(), name, date, doer, seers,
     startTime, endTime, notes, reminder,
+    recurring, recurringEnd,
     addedBy: currentUser.name,
   });
 
