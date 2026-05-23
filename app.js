@@ -331,7 +331,7 @@ function renderAuthScreen(app, mode = "login") {
           ${!isLogin ? `<input type="text" id="auth-name" placeholder="Your name (e.g. Dad, Sarah)" autocomplete="name" />` : ""}
           <input type="email" id="auth-email" placeholder="Email address" autocomplete="email" />
           <input type="password" id="auth-password" placeholder="Password${!isLogin ? " (min. 6 characters)" : ""}" autocomplete="${isLogin ? "current-password" : "new-password"}" />
-          <button class="btn-primary" onclick="${isLogin ? "doLogin()" : "doRegister()}">
+          <button class="btn-primary" onclick="${isLogin ? "doLogin()" : "doRegister()"}">
             ${isLogin ? "Sign in" : "Create account"}
           </button>
         </div>
