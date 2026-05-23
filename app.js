@@ -1,6 +1,6 @@
 // ============================================================
-//  FAMILY HUB — App v3
-//  Added: recurring events (weekly / fortnightly)
+//  FAMILY HUB — App v4
+//  Added: edit existing events (single occurrence or all)
 //  All existing event fields unchanged — fully backwards compatible
 // ============================================================
 
@@ -47,6 +47,10 @@ let currentUser = null;
 let curYear, curMonth;
 let saveTimeout = null;
 let activeTab = "cal";
+
+// Edit state — null when adding, populated when editing
+let editingEventId = null;      // id of the event being edited
+let editingOccurrenceDate = null; // date of the specific occurrence (for recurring)
 
 // ── Data layer ────────────────────────────────────────────────
 
@@ -505,8 +509,8 @@ function renderCalPanel() {
       <span class="legend-item">🔁 Recurring</span>
     </div>
 
-    <div class="section-card">
-      <h3>Add event</h3>
+    <div class="section-card" id="event-form-card">
+      <h3 id="event-form-title">Add event</h3>
       <div class="form-stack">
         <input type="text" id="ev-name" placeholder="Event name" />
 
@@ -561,7 +565,10 @@ function renderCalPanel() {
         </div>
 
         <input type="text" id="ev-notes" placeholder="Notes (optional)" />
-        <button class="btn-primary" onclick="addEvent()">Add to calendar</button>
+        <div class="form-row-2" id="form-buttons">
+          <button class="btn-primary" id="ev-submit-btn" onclick="submitEventForm()">Add to calendar</button>
+          <button class="btn-cancel" id="ev-cancel-btn" onclick="cancelEdit()" style="display:none;">Cancel</button>
+        </div>
       </div>
     </div>
 
@@ -614,6 +621,11 @@ function eventItemHtml(e, role) {
     : `<button class="del-btn" onclick="deleteEvent('${e.id}')" aria-label="Delete">✕</button>`)
     : "";
 
+  // Edit button — only shown for doer, not seers
+  const editBtn = !isSee
+    ? `<button class="edit-btn" onclick="startEdit('${e.id}', '${e.date}')" aria-label="Edit">✏️</button>`
+    : "";
+
   return `
     <div class="event-item${isSee ? " event-item-see" : ""}">
       ${isSee ? `<div class="see-indicator" title="You're aware of this event">👁</div>` : ""}
@@ -627,11 +639,217 @@ function eventItemHtml(e, role) {
         ${e.notes ? `<div class="event-notes">${e.notes}</div>` : ""}
         ${reminderLabel ? `<div class="reminder-label">⏰ ${reminderLabel}</div>` : ""}
       </div>
-      ${deleteBtn}
+      <div class="event-actions">
+        ${editBtn}
+        ${deleteBtn}
+      </div>
     </div>`;
 }
 
-// ── Delete recurring — prompt user ────────────────────────────
+// ── Edit events ───────────────────────────────────────────────
+
+function startEdit(id, occurrenceDate) {
+  const ev = state.events.find((e) => e.id === id);
+  if (!ev) return;
+
+  const isRecurring = ev.recurring && ev.recurring !== "none";
+
+  if (isRecurring) {
+    // Ask whether to edit just this occurrence or all
+    confirmEditRecurring(id, occurrenceDate);
+  } else {
+    // Non-recurring — edit directly
+    editingEventId = id;
+    editingOccurrenceDate = null;
+    fillEditForm(ev, occurrenceDate);
+  }
+}
+
+function confirmEditRecurring(id, occurrenceDate) {
+  const existing = document.getElementById("delete-modal");
+  if (existing) existing.remove();
+
+  const modal = document.createElement("div");
+  modal.id = "delete-modal";
+  modal.className = "delete-modal";
+  modal.innerHTML = `
+    <div class="delete-modal-box">
+      <p class="delete-modal-title">Edit recurring event</p>
+      <p class="delete-modal-sub">Do you want to edit just this occurrence, or all occurrences?</p>
+      <div class="delete-modal-btns">
+        <button class="delete-modal-btn" onclick="editOccurrence('${id}', '${occurrenceDate}')">This occurrence only</button>
+        <button class="delete-modal-btn delete-modal-btn-danger" onclick="editAllOccurrences('${id}', '${occurrenceDate}')">All occurrences</button>
+        <button class="delete-modal-btn delete-modal-btn-cancel" onclick="document.getElementById('delete-modal').remove()">Cancel</button>
+      </div>
+    </div>`;
+
+  document.getElementById("main-content").prepend(modal);
+}
+
+function editOccurrence(id, occurrenceDate) {
+  document.getElementById("delete-modal")?.remove();
+  const ev = state.events.find((e) => e.id === id);
+  if (!ev) return;
+  editingEventId = id;
+  editingOccurrenceDate = occurrenceDate;
+  // Fill form with this occurrence's date, but treat as a one-off edit
+  fillEditForm(ev, occurrenceDate, true);
+}
+
+function editAllOccurrences(id, occurrenceDate) {
+  document.getElementById("delete-modal")?.remove();
+  const ev = state.events.find((e) => e.id === id);
+  if (!ev) return;
+  editingEventId = id;
+  editingOccurrenceDate = null;
+  fillEditForm(ev, occurrenceDate, false);
+}
+
+function fillEditForm(ev, dateOverride, isSingleOccurrence = false) {
+  // Scroll to form
+  document.getElementById("event-form-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+  // Update form title and button
+  const title = document.getElementById("event-form-title");
+  const btn = document.getElementById("ev-submit-btn");
+  const cancelBtn = document.getElementById("ev-cancel-btn");
+  if (title) title.textContent = "Edit event";
+  if (btn) btn.textContent = "Save changes";
+  if (cancelBtn) cancelBtn.style.display = "block";
+
+  // Fill in all the fields
+  const name = document.getElementById("ev-name");
+  const date = document.getElementById("ev-date");
+  const doer = document.getElementById("ev-doer");
+  const start = document.getElementById("ev-start");
+  const end = document.getElementById("ev-end");
+  const recur = document.getElementById("ev-recur");
+  const recurEnd = document.getElementById("ev-recur-end");
+  const recurEndWrap = document.getElementById("recur-end-wrap");
+  const reminder = document.getElementById("ev-reminder");
+  const notes = document.getElementById("ev-notes");
+
+  if (name) name.value = ev.name;
+  if (date) date.value = dateOverride || ev.date;
+  if (doer) doer.value = ev.doer;
+  if (start) start.value = ev.startTime || "";
+  if (end) end.value = ev.endTime || "";
+  if (notes) notes.value = ev.notes || "";
+  if (reminder) reminder.value = ev.reminder || "none";
+
+  // For single occurrence edits, hide recurring options
+  if (isSingleOccurrence) {
+    if (recur) { recur.value = "none"; recur.disabled = true; }
+    if (recurEndWrap) recurEndWrap.style.display = "none";
+  } else {
+    if (recur) { recur.value = ev.recurring || "none"; recur.disabled = false; }
+    if (recurEnd) recurEnd.value = ev.recurringEnd || addDays(ev.date, 365);
+    if (recurEndWrap) recurEndWrap.style.display = (ev.recurring && ev.recurring !== "none") ? "block" : "none";
+  }
+
+  // Tick the right seers
+  document.querySelectorAll('input[name="seer"]').forEach((cb) => {
+    cb.checked = (ev.seers || []).includes(cb.value);
+  });
+}
+
+function cancelEdit() {
+  editingEventId = null;
+  editingOccurrenceDate = null;
+  // Reset form title and button
+  const title = document.getElementById("event-form-title");
+  const btn = document.getElementById("ev-submit-btn");
+  const cancelBtn = document.getElementById("ev-cancel-btn");
+  const recur = document.getElementById("ev-recur");
+  if (title) title.textContent = "Add event";
+  if (btn) btn.textContent = "Add to calendar";
+  if (cancelBtn) cancelBtn.style.display = "none";
+  if (recur) recur.disabled = false;
+  // Clear all fields
+  ["ev-name", "ev-start", "ev-end", "ev-notes"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+  document.getElementById("ev-date").value = todayStr();
+  document.getElementById("ev-reminder").value = "none";
+  document.getElementById("ev-recur").value = "none";
+  document.getElementById("recur-end-wrap").style.display = "none";
+  document.querySelectorAll('input[name="seer"]').forEach((cb) => {
+    cb.checked = cb.value === currentUser.name;
+  });
+}
+
+// Single submit handler for both add and edit
+function submitEventForm() {
+  if (editingEventId) {
+    saveEdit();
+  } else {
+    addEvent();
+  }
+}
+
+async function saveEdit() {
+  const name = document.getElementById("ev-name")?.value.trim();
+  const date = document.getElementById("ev-date")?.value;
+  const doer = document.getElementById("ev-doer")?.value;
+  const startTime = document.getElementById("ev-start")?.value || "";
+  const endTime = document.getElementById("ev-end")?.value || "";
+  const notes = document.getElementById("ev-notes")?.value.trim() || "";
+  const reminder = document.getElementById("ev-reminder")?.value || "none";
+  const recur = document.getElementById("ev-recur");
+  const recurring = recur?.disabled ? "none" : (recur?.value || "none");
+  const recurringEnd = recurring !== "none"
+    ? (document.getElementById("ev-recur-end")?.value || "")
+    : "";
+
+  const seerChecks = document.querySelectorAll('input[name="seer"]:checked');
+  const seers = Array.from(seerChecks).map((c) => c.value);
+  if (!seers.includes(doer)) seers.push(doer);
+
+  if (!name || !date) return;
+
+  if (editingOccurrenceDate) {
+    // Editing a single occurrence of a recurring event —
+    // split the series: end the original before this date, add a one-off
+    const originalEv = state.events.find((e) => e.id === editingEventId);
+    if (originalEv) {
+      if (editingOccurrenceDate === originalEv.date) {
+        // First occurrence — move original start forward by one interval
+        const days = originalEv.recurring === "weekly" ? 7 : 14;
+        originalEv.date = addDays(originalEv.date, days);
+      } else {
+        // Later occurrence — trim end of original to day before
+        originalEv.recurringEnd = addDays(editingOccurrenceDate, -1);
+      }
+    }
+    // Add the edited occurrence as a standalone event
+    state.events.push({
+      id: uid(), name, date, doer, seers,
+      startTime, endTime, notes, reminder,
+      recurring: "none", recurringEnd: "",
+      addedBy: currentUser.name,
+    });
+  } else {
+    // Editing all occurrences — update in place
+    const idx = state.events.findIndex((e) => e.id === editingEventId);
+    if (idx !== -1) {
+      state.events[idx] = {
+        ...state.events[idx],
+        name, date, doer, seers,
+        startTime, endTime, notes, reminder,
+        recurring, recurringEnd,
+      };
+    }
+  }
+
+  editingEventId = null;
+  editingOccurrenceDate = null;
+  await saveData();
+  renderCalPanel();
+  checkReminders();
+}
+
+
 
 function confirmDeleteRecurring(id, occurrenceDate) {
   // Show a small inline confirmation instead of browser confirm()
@@ -763,7 +981,6 @@ async function addEvent() {
 
   if (!name || !date) return;
 
-  // NEW fields: recurring + recurringEnd — old events simply won't have them
   state.events.push({
     id: uid(), name, date, doer, seers,
     startTime, endTime, notes, reminder,
