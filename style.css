@@ -382,3 +382,43 @@ select {
 .delete-modal-btn-danger { background: #fef2f2; color: #dc2626; border-color: #fecaca; }
 .delete-modal-btn-danger:hover { background: #fee2e2; }
 .delete-modal-btn-cancel { color: var(--text-muted); font-weight: 400; }
+
+/* ── Edit button & event actions ─────────────────────────── */
+.event-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-shrink: 0;
+  align-items: center;
+}
+.edit-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 15px;
+  padding: 5px;
+  opacity: 0.35;
+  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.edit-btn:hover { opacity: 1; background: #fef3c7; }
+
+/* ── Cancel button ───────────────────────────────────────── */
+.btn-cancel {
+  width: 100%;
+  padding: 13px;
+  background: var(--bg);
+  color: var(--text-muted);
+  border: var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  transition: opacity 0.15s;
+}
+.btn-cancel:hover { background: #e5e7eb; color: var(--text); }
