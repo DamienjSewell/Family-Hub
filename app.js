@@ -136,7 +136,11 @@ setInterval(async () => {
 function addDays(dateStr, days) {
   const d = new Date(dateStr + "T00:00:00");
   d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+  // Use local date parts to avoid UTC timezone shift (important for AU timezones)
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 function expandRecurringEvents(events, fromDate, toDate) {
