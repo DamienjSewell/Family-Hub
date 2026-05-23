@@ -1,5 +1,7 @@
 // ============================================================
-//  FAMILY HUB — App (no AI version)
+//  FAMILY HUB — App v2
+//  Features: auth, filtered calendar, see/do events,
+//  start/end times, in-app reminders
 // ============================================================
 
 const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${CONFIG.JSONBIN_BIN_ID}`;
@@ -21,13 +23,23 @@ const MEMBER_COLORS = [
 ];
 
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const DAYS = ["Su","Mo","Tu","We","Th","Fr","Sa"];
+const REMINDER_OPTIONS = [
+  { label: "At the time", minutes: 0 },
+  { label: "5 minutes before", minutes: 5 },
+  { label: "15 minutes before", minutes: 15 },
+  { label: "30 minutes before", minutes: 30 },
+  { label: "1 hour before", minutes: 60 },
+  { label: "2 hours before", minutes: 120 },
+  { label: "1 day before", minutes: 1440 },
+];
 
-let state = { events: [], todos: [], members: [] };
+let state = { events: [], todos: [], members: [], users: [] };
 let currentUser = null;
 let curYear, curMonth;
 let saveTimeout = null;
-let lastSyncTime = null;
+let activeTab = "cal";
 
 // ── Data layer ────────────────────────────────────────────────
 
@@ -36,29 +48,28 @@ async function loadData() {
     const res = await fetch(JSONBIN_URL + "/latest", { headers: JSONBIN_HEADERS });
     if (!res.ok) throw new Error("Load failed");
     const json = await res.json();
-    state = json.record || { events: [], todos: [], members: [] };
+    state = json.record || {};
   } catch (e) {
     console.warn("Could not load data:", e);
-    state = { events: [], todos: [], members: [] };
+    state = {};
   }
   if (!state.events) state.events = [];
   if (!state.todos) state.todos = [];
-  if (!state.members || !state.members.length) {
-    state.members = [
-      { name: "Dad", colorIdx: 0 },
-      { name: "Mum", colorIdx: 1 },
-      { name: "Kids", colorIdx: 2 },
-    ];
+  if (!state.members) state.members = [];
+  if (!state.users) state.users = [];
+
+  // Restore session
+  const session = Auth.getSession();
+  if (session && state.users.find((u) => u.email === session.email)) {
+    currentUser = session;
   }
 
-  // Remember who was last logged in on this device
-  const saved = localStorage.getItem("familyhub-user");
-  if (saved && state.members.find((m) => m.name === saved)) {
-    currentUser = saved;
-  }
+  const now = new Date();
+  curYear = now.getFullYear();
+  curMonth = now.getMonth();
 
-  lastSyncTime = new Date();
   render();
+  if (currentUser) checkReminders();
 }
 
 async function saveData() {
@@ -70,56 +81,120 @@ async function saveData() {
         headers: JSONBIN_HEADERS,
         body: JSON.stringify(state),
       });
-      lastSyncTime = new Date();
-      updateSyncBadge();
+      updateSyncBadge("☁️ Saved");
+      setTimeout(() => updateSyncBadge("☁️ Shared"), 2000);
     } catch (e) {
       console.warn("Save failed:", e);
     }
   }, 500);
 }
 
-function updateSyncBadge() {
-  const badge = document.getElementById("sync-badge");
-  if (badge && lastSyncTime) {
-    badge.textContent = "☁️ Saved";
-    setTimeout(() => { if (badge) badge.textContent = "☁️ Shared"; }, 2000);
-  }
+function updateSyncBadge(text) {
+  const b = document.getElementById("sync-badge");
+  if (b) b.textContent = text;
 }
 
-// Poll for changes from other family members every 30 seconds
+// Poll every 30s for updates from other family members
 setInterval(async () => {
   if (!currentUser) return;
   try {
     const res = await fetch(JSONBIN_URL + "/latest", { headers: JSONBIN_HEADERS });
     if (!res.ok) return;
     const json = await res.json();
-    const fresh = json.record;
-    if (JSON.stringify(fresh) !== JSON.stringify(state)) {
-      state = fresh;
+    if (JSON.stringify(json.record) !== JSON.stringify(state)) {
+      state = json.record;
+      if (!state.events) state.events = [];
+      if (!state.todos) state.todos = [];
+      if (!state.users) state.users = [];
       rerenderCurrentPanel();
     }
   } catch (e) {}
 }, 30000);
 
+// ── Reminders ─────────────────────────────────────────────────
+
+function checkReminders() {
+  if (!currentUser) return;
+  const now = new Date();
+  const upcoming = [];
+
+  state.events.forEach((ev) => {
+    // Only check events relevant to this user
+    const isDoer = ev.doer === currentUser.name;
+    const isSeer = ev.seers && ev.seers.includes(currentUser.name);
+    if (!isDoer && !isSeer) return;
+    if (!ev.reminder || ev.reminder === "none") return;
+    if (!ev.startTime) return;
+
+    // Build event datetime
+    const [year, month, day] = ev.date.split("-").map(Number);
+    const [hour, min] = ev.startTime.split(":").map(Number);
+    const eventDt = new Date(year, month - 1, day, hour, min);
+    const reminderDt = new Date(eventDt.getTime() - ev.reminder * 60000);
+    const diffMins = (eventDt - now) / 60000;
+
+    // Show reminder if we're within the reminder window and event hasn't passed
+    if (diffMins > 0 && now >= reminderDt) {
+      upcoming.push({ ev, diffMins: Math.round(diffMins) });
+    }
+  });
+
+  if (upcoming.length > 0) {
+    showReminderBanner(upcoming);
+  }
+}
+
+function showReminderBanner(items) {
+  const existing = document.getElementById("reminder-banner");
+  if (existing) existing.remove();
+
+  const banner = document.createElement("div");
+  banner.id = "reminder-banner";
+  banner.className = "reminder-banner";
+
+  const lines = items.map((r) => {
+    const mins = r.diffMins;
+    const timeLabel = mins < 60
+      ? `in ${mins} minute${mins !== 1 ? "s" : ""}`
+      : mins < 1440
+        ? `in ${Math.round(mins / 60)} hour${Math.round(mins / 60) !== 1 ? "s" : ""}`
+        : "tomorrow";
+    return `<div class="reminder-item">⏰ <strong>${r.ev.name}</strong> ${timeLabel}${r.ev.startTime ? " at " + formatTime(r.ev.startTime) : ""}</div>`;
+  }).join("");
+
+  banner.innerHTML = `
+    <div class="reminder-content">
+      <div class="reminder-title">Upcoming reminders</div>
+      ${lines}
+    </div>
+    <button class="reminder-close" onclick="this.parentElement.remove()">✕</button>`;
+
+  document.getElementById("app").prepend(banner);
+}
+
 // ── Helpers ───────────────────────────────────────────────────
 
 function getMember(name) {
-  return state.members.find((m) => m.name === name) || { name, colorIdx: 0 };
+  const u = state.users.find((u) => u.name === name);
+  if (u) return u;
+  const m = state.members.find((m) => m.name === name);
+  return m || { name, colorIdx: 0 };
 }
 function memberColor(name) {
   const m = getMember(name);
-  return MEMBER_COLORS[m.colorIdx % MEMBER_COLORS.length];
+  return MEMBER_COLORS[(m.colorIdx || 0) % MEMBER_COLORS.length];
 }
 function initials(name) {
-  return name.split(" ").map((w) => w[0]).join("").toUpperCase().slice(0, 2);
+  return (name || "?").split(" ").map((w) => w[0]).join("").toUpperCase().slice(0, 2);
 }
 function avatarHtml(name, size = 26) {
   const c = memberColor(name);
-  return `<span class="avatar" style="width:${size}px;height:${size}px;background:${c.bg};color:${c.text};font-size:${Math.round(size * 0.42)}px;">${initials(name)}</span>`;
+  return `<span class="avatar" style="width:${size}px;height:${size}px;background:${c.bg};color:${c.text};font-size:${Math.round(size * 0.4)}px;">${initials(name)}</span>`;
 }
-function whoPill(name) {
+function whoPill(name, role) {
   const c = memberColor(name);
-  return `<span class="who-pill" style="background:${c.bg};color:${c.text};">${avatarHtml(name, 14)} ${name}</span>`;
+  const roleIcon = role === "do" ? "✅" : "👁";
+  return `<span class="who-pill" style="background:${c.bg};color:${c.text};">${avatarHtml(name, 14)} ${name} <span class="role-icon">${roleIcon}</span></span>`;
 }
 function todayStr() {
   return new Date().toISOString().slice(0, 10);
@@ -128,12 +203,19 @@ function formatDate(dateStr) {
   const d = new Date(dateStr + "T00:00:00");
   return d.toLocaleDateString("en-AU", { weekday: "short", day: "numeric", month: "short" });
 }
+function formatTime(t) {
+  if (!t) return "";
+  const [h, m] = t.split(":").map(Number);
+  const ampm = h >= 12 ? "pm" : "am";
+  const hour = h % 12 || 12;
+  return `${hour}:${String(m).padStart(2, "0")}${ampm}`;
+}
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
-
-let activeTab = "cal";
-
+function allMemberNames() {
+  return state.users.map((u) => u.name);
+}
 function rerenderCurrentPanel() {
   if (activeTab === "cal") renderCalPanel();
   if (activeTab === "todo") renderTodoPanel();
@@ -145,40 +227,86 @@ function render() {
   const app = document.getElementById("app");
   document.getElementById("loading")?.remove();
   if (!currentUser) {
-    renderSetup(app);
+    renderAuthScreen(app);
   } else {
-    const now = new Date();
-    if (!curYear) { curYear = now.getFullYear(); curMonth = now.getMonth(); }
     renderApp(app);
   }
 }
 
-function renderSetup(app) {
-  const grid = state.members.map((m) => `
-    <button class="member-btn" onclick="selectUser('${m.name}')">
-      ${avatarHtml(m.name, 34)}
-      <span>${m.name}</span>
-    </button>`).join("");
+// ── Auth screen ───────────────────────────────────────────────
 
+function renderAuthScreen(app, mode = "login") {
+  const isLogin = mode === "login";
   app.innerHTML = `
-    <div class="setup-screen">
-      <div class="setup-icon">🏠</div>
-      <h1>${CONFIG.FAMILY_NAME} Hub</h1>
-      <p>Who are you? Tap your name to open the calendar.</p>
-      <div class="member-grid">${grid}</div>
-      <div class="divider-line"></div>
-      <p class="add-label">Add a family member</p>
-      <div class="add-member-row">
-        <input type="text" id="new-member" placeholder="Name…" />
-        <button onclick="addMember()">Add</button>
+    <div class="auth-screen">
+      <div class="auth-icon">🏠</div>
+      <h1>${CONFIG.FAMILY_NAME}</h1>
+      <p class="auth-subtitle">${isLogin ? "Sign in to your account" : "Create your family account"}</p>
+
+      <div class="auth-card">
+        <div class="auth-toggle">
+          <button class="auth-toggle-btn ${isLogin ? "active" : ""}" onclick="renderAuthScreen(document.getElementById('app'), 'login')">Sign in</button>
+          <button class="auth-toggle-btn ${!isLogin ? "active" : ""}" onclick="renderAuthScreen(document.getElementById('app'), 'register')">Register</button>
+        </div>
+
+        <div id="auth-error" class="auth-error" style="display:none;"></div>
+
+        <div class="form-stack">
+          ${!isLogin ? `<input type="text" id="auth-name" placeholder="Your name (e.g. Dad, Sarah)" autocomplete="name" />` : ""}
+          <input type="email" id="auth-email" placeholder="Email address" autocomplete="email" />
+          <input type="password" id="auth-password" placeholder="Password${!isLogin ? " (min. 6 characters)" : ""}" autocomplete="${isLogin ? "current-password" : "new-password"}" />
+          <button class="btn-primary" onclick="${isLogin ? "doLogin()" : "doRegister()"}">
+            ${isLogin ? "Sign in" : "Create account"}
+          </button>
+        </div>
       </div>
-      <p class="shared-note">☁️ Everyone shares the same calendar and tasks</p>
+      <p class="auth-note">☁️ All family members share the same calendar and tasks</p>
     </div>`;
 
-  document.getElementById("new-member")?.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") addMember();
+  // Allow Enter key to submit
+  app.querySelectorAll("input").forEach((inp) => {
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") isLogin ? doLogin() : doRegister();
+    });
   });
 }
+
+async function doLogin() {
+  const email = document.getElementById("auth-email")?.value;
+  const password = document.getElementById("auth-password")?.value;
+  showAuthError("");
+  const result = await Auth.login(email, password, state);
+  if (!result.ok) { showAuthError(result.error); return; }
+  currentUser = result.user;
+  render();
+  checkReminders();
+}
+
+async function doRegister() {
+  const name = document.getElementById("auth-name")?.value;
+  const email = document.getElementById("auth-email")?.value;
+  const password = document.getElementById("auth-password")?.value;
+  showAuthError("");
+  const result = await Auth.register(name, email, password, state, saveData);
+  if (!result.ok) { showAuthError(result.error); return; }
+  currentUser = result.user;
+  render();
+}
+
+function showAuthError(msg) {
+  const el = document.getElementById("auth-error");
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = msg ? "block" : "none";
+}
+
+function doLogout() {
+  Auth.logout();
+  currentUser = null;
+  render();
+}
+
+// ── App shell ─────────────────────────────────────────────────
 
 function renderApp(app) {
   app.innerHTML = `
@@ -186,22 +314,51 @@ function renderApp(app) {
       <div class="app-title">🏠 ${CONFIG.FAMILY_NAME}</div>
       <div style="display:flex;align-items:center;gap:10px;">
         <span class="sync-badge" id="sync-badge">☁️ Shared</span>
-        <button class="me-chip" onclick="switchUser()">
-          ${avatarHtml(currentUser)} <span>${currentUser}</span> ▾
+        <button class="me-chip" onclick="showUserMenu()">
+          ${avatarHtml(currentUser.name)} <span>${currentUser.name}</span> ▾
         </button>
       </div>
+    </div>
+    <div id="user-menu" class="user-menu" style="display:none;">
+      <div class="user-menu-name">${currentUser.name}</div>
+      <div class="user-menu-email">${currentUser.email}</div>
+      <hr style="border:none;border-top:1px solid #e5e7eb;margin:8px 0;" />
+      <button class="user-menu-item" onclick="doLogout()">Sign out</button>
     </div>
     <nav class="tabs">
       <button class="tab active" id="tab-cal" onclick="showTab('cal')">📅 Calendar</button>
       <button class="tab" id="tab-todo" onclick="showTab('todo')">✅ To-do</button>
     </nav>
-    <main>
+    <main id="main-content">
       <div id="panel-cal" class="panel active"></div>
       <div id="panel-todo" class="panel"></div>
     </main>`;
 
   renderCalPanel();
   renderTodoPanel();
+
+  // Close user menu when clicking elsewhere
+  document.addEventListener("click", closeUserMenuOnOutsideClick);
+}
+
+function showUserMenu() {
+  const menu = document.getElementById("user-menu");
+  if (menu) menu.style.display = menu.style.display === "none" ? "block" : "none";
+}
+function closeUserMenuOnOutsideClick(e) {
+  const menu = document.getElementById("user-menu");
+  const chip = document.querySelector(".me-chip");
+  if (menu && !menu.contains(e.target) && chip && !chip.contains(e.target)) {
+    menu.style.display = "none";
+  }
+}
+
+function showTab(name) {
+  activeTab = name;
+  ["cal", "todo"].forEach((n) => {
+    document.getElementById("tab-" + n)?.classList.toggle("active", n === name);
+    document.getElementById("panel-" + n)?.classList.toggle("active", n === name);
+  });
 }
 
 // ── Calendar panel ────────────────────────────────────────────
@@ -209,6 +366,12 @@ function renderApp(app) {
 function renderCalPanel() {
   const panel = document.getElementById("panel-cal");
   if (!panel) return;
+
+  // Events relevant to current user
+  const myEvents = state.events.filter((e) =>
+    e.doer === currentUser.name ||
+    (e.seers && e.seers.includes(currentUser.name))
+  );
 
   const firstDay = new Date(curYear, curMonth, 1).getDay();
   const daysInMonth = new Date(curYear, curMonth + 1, 0).getDate();
@@ -224,10 +387,11 @@ function renderCalPanel() {
   for (let d = 1; d <= daysInMonth; d++) {
     const ds = `${curYear}-${String(curMonth + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
     const isToday = today.getFullYear() === curYear && today.getMonth() === curMonth && today.getDate() === d;
-    const dayEvs = state.events.filter((e) => e.date === ds);
+    const dayEvs = myEvents.filter((e) => e.date === ds);
     const pips = dayEvs.slice(0, 3).map((e) => {
-      const c = memberColor(e.owner);
-      return `<span class="ev-pip" style="background:${c.text};"></span>`;
+      const isDoer = e.doer === currentUser.name;
+      const c = memberColor(currentUser.name);
+      return `<span class="ev-pip${isDoer ? "" : " ev-pip-see"}" style="background:${isDoer ? c.text : "#9ca3af"};"></span>`;
     }).join("");
     cells += `<div class="cal-day${isToday ? " today" : ""}"><span class="day-num">${d}</span>${pips}</div>`;
   }
@@ -235,33 +399,23 @@ function renderCalPanel() {
   const rem = total % 7 === 0 ? 0 : 7 - (total % 7);
   for (let i = 1; i <= rem; i++) cells += `<div class="cal-day other"><span class="day-num">${i}</span></div>`;
 
-  const memberOpts = state.members.map((m) =>
-    `<option value="${m.name}"${m.name === currentUser ? " selected" : ""}>${m.name}</option>`
+  // Build member checkboxes for seers
+  const members = allMemberNames();
+  const memberChecks = members.map((name) => `
+    <label class="member-check">
+      <input type="checkbox" name="seer" value="${name}" ${name === currentUser.name ? "checked" : ""} />
+      ${avatarHtml(name, 18)} ${name}
+    </label>`).join("");
+
+  const reminderOpts = REMINDER_OPTIONS.map((r) =>
+    `<option value="${r.minutes}">${r.label}</option>`
   ).join("");
 
-  const upcoming = state.events
-    .filter((e) => e.date >= todayStr())
-    .sort((a, b) => a.date.localeCompare(b.date));
-
-  const past = state.events
-    .filter((e) => e.date < todayStr())
-    .sort((a, b) => b.date.localeCompare(a.date))
-    .slice(0, 5);
-
-  const evHtml = (arr, emptyMsg) => arr.length
-    ? arr.map((e) => `
-      <div class="event-item">
-        <div class="event-body">
-          <div class="event-title">${e.name}</div>
-          <div class="event-meta">
-            <span class="date-pill">📅 ${formatDate(e.date)}</span>
-            ${whoPill(e.owner)}
-            ${e.notes ? `<span class="event-notes">${e.notes}</span>` : ""}
-          </div>
-        </div>
-        <button class="del-btn" onclick="deleteEvent('${e.id}')" aria-label="Delete event">✕</button>
-      </div>`).join("")
-    : `<p class="empty-msg">${emptyMsg}</p>`;
+  // Split events into "doing" and "seeing"
+  const upcomingDo = myEvents.filter((e) => e.date >= todayStr() && e.doer === currentUser.name)
+    .sort((a, b) => a.date.localeCompare(b.date) || (a.startTime || "").localeCompare(b.startTime || ""));
+  const upcomingSee = myEvents.filter((e) => e.date >= todayStr() && e.doer !== currentUser.name)
+    .sort((a, b) => a.date.localeCompare(b.date) || (a.startTime || "").localeCompare(b.startTime || ""));
 
   panel.innerHTML = `
     <div class="month-nav">
@@ -269,32 +423,106 @@ function renderCalPanel() {
       <span class="month-title">${MONTHS[curMonth]} ${curYear}</span>
       <button class="nav-btn" onclick="changeMonth(1)">›</button>
     </div>
-
     <div class="cal-grid">${dayHeaders}${cells}</div>
+
+    <div class="legend-row">
+      <span class="legend-item"><span class="legend-pip" style="background:#534AB7;"></span> My events (Do)</span>
+      <span class="legend-item"><span class="legend-pip" style="background:#9ca3af;"></span> Aware of (See)</span>
+    </div>
 
     <div class="section-card">
       <h3>Add event</h3>
       <div class="form-stack">
         <input type="text" id="ev-name" placeholder="Event name" />
+
         <div class="form-row-2">
-          <input type="date" id="ev-date" value="${todayStr()}" />
-          <select id="ev-owner">${memberOpts}</select>
+          <div>
+            <label class="field-label">Date</label>
+            <input type="date" id="ev-date" value="${todayStr()}" />
+          </div>
+          <div>
+            <label class="field-label">Responsible (Do)</label>
+            <select id="ev-doer">
+              ${members.map((n) => `<option value="${n}"${n === currentUser.name ? " selected" : ""}>${n}</option>`).join("")}
+            </select>
+          </div>
         </div>
+
+        <div class="form-row-2">
+          <div>
+            <label class="field-label">Start time (optional)</label>
+            <input type="time" id="ev-start" />
+          </div>
+          <div>
+            <label class="field-label">End time (optional)</label>
+            <input type="time" id="ev-end" />
+          </div>
+        </div>
+
+        <div>
+          <label class="field-label">Who should see this event?</label>
+          <div class="member-checks" id="seer-checks">${memberChecks}</div>
+        </div>
+
+        <div>
+          <label class="field-label">Reminder</label>
+          <select id="ev-reminder">
+            <option value="none">No reminder</option>
+            ${reminderOpts}
+          </select>
+        </div>
+
         <input type="text" id="ev-notes" placeholder="Notes (optional)" />
         <button class="btn-primary" onclick="addEvent()">Add to calendar</button>
       </div>
     </div>
 
-    <div class="section-label">Upcoming (${upcoming.length})</div>
-    ${evHtml(upcoming, "No upcoming events — add one above!")}
+    ${upcomingDo.length ? `
+      <div class="section-label">My upcoming events — I'm doing (${upcomingDo.length})</div>
+      ${upcomingDo.map((e) => eventItemHtml(e, "do")).join("")}` : `
+      <div class="section-label">My upcoming events</div>
+      <p class="empty-msg">Nothing coming up — add one above!</p>`}
 
-    ${past.length ? `
-      <div class="section-label" style="margin-top:1.5rem;">Recent past</div>
-      ${evHtml(past, "")}` : ""}`;
+    ${upcomingSee.length ? `
+      <div class="section-label aware-label" style="margin-top:1.5rem;">Events I'm aware of — others are doing (${upcomingSee.length})</div>
+      ${upcomingSee.map((e) => eventItemHtml(e, "see")).join("")}` : ""}`;
 
   document.getElementById("ev-name")?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") addEvent();
   });
+}
+
+function eventItemHtml(e, role) {
+  const isSee = role === "see";
+  const timeStr = e.startTime
+    ? `${formatTime(e.startTime)}${e.endTime ? " – " + formatTime(e.endTime) : ""}`
+    : "";
+  const reminderLabel = e.reminder && e.reminder !== "none"
+    ? REMINDER_OPTIONS.find((r) => r.minutes == e.reminder)?.label || ""
+    : "";
+
+  // Show all people on the event
+  const doerPill = whoPill(e.doer, "do");
+  const seerPills = (e.seers || [])
+    .filter((s) => s !== e.doer)
+    .map((s) => whoPill(s, "see"))
+    .join("");
+
+  return `
+    <div class="event-item${isSee ? " event-item-see" : ""}">
+      ${isSee ? `<div class="see-indicator" title="You're aware of this event">👁</div>` : ""}
+      <div class="event-body">
+        <div class="event-title">${e.name}</div>
+        <div class="event-meta">
+          <span class="date-pill">📅 ${formatDate(e.date)}${timeStr ? " · " + timeStr : ""}</span>
+          ${doerPill}
+          ${seerPills}
+        </div>
+        ${e.notes ? `<div class="event-notes">${e.notes}</div>` : ""}
+        ${reminderLabel ? `<div class="reminder-label">⏰ ${reminderLabel}</div>` : ""}
+      </div>
+      ${!isSee ? `<button class="del-btn" onclick="deleteEvent('${e.id}')" aria-label="Delete">✕</button>` : ""}
+    </div>`;
 }
 
 // ── To-do panel ───────────────────────────────────────────────
@@ -303,38 +531,23 @@ function renderTodoPanel() {
   const panel = document.getElementById("panel-todo");
   if (!panel) return;
 
-  const memberOpts = state.members.map((m) =>
-    `<option value="${m.name}"${m.name === currentUser ? " selected" : ""}>${m.name}</option>`
+  const members = allMemberNames();
+  const memberOpts = members.map((n) =>
+    `<option value="${n}"${n === currentUser.name ? " selected" : ""}>${n}</option>`
   ).join("");
 
-  // Group pending todos by owner
-  const pending = state.todos.filter((t) => !t.done);
+  const myPending = state.todos.filter((t) => !t.done && t.owner === currentUser.name);
+  const otherPending = state.todos.filter((t) => !t.done && t.owner !== currentUser.name);
   const done = state.todos.filter((t) => t.done);
 
-  // Build a "my tasks" section and "everyone else" section
-  const myTasks = pending.filter((t) => t.owner === currentUser);
-  const otherTasks = pending.filter((t) => t.owner !== currentUser);
-
-  const todoItemHtml = (t) => `
-    <div class="todo-item">
-      <button class="check-btn" onclick="toggleTodo('${t.id}')" aria-label="Mark done">
-        <span class="check-inner"></span>
+  const todoHtml = (t, isDone) => `
+    <div class="todo-item${isDone ? " done-item" : ""}">
+      <button class="check-btn${isDone ? " done" : ""}" onclick="toggleTodo('${t.id}')" aria-label="${isDone ? "Mark undone" : "Mark done"}">
+        <span class="check-inner">${isDone ? "✓" : ""}</span>
       </button>
       <div class="todo-body">
-        <div class="todo-title">${t.text}</div>
-        <div class="todo-meta">${whoPill(t.owner)}</div>
-      </div>
-      <button class="del-btn" onclick="deleteTodo('${t.id}')" aria-label="Delete">✕</button>
-    </div>`;
-
-  const doneItemHtml = (t) => `
-    <div class="todo-item done-item">
-      <button class="check-btn done" onclick="toggleTodo('${t.id}')" aria-label="Mark undone">
-        <span class="check-inner">✓</span>
-      </button>
-      <div class="todo-body">
-        <div class="todo-title done-text">${t.text}</div>
-        <div class="todo-meta">${whoPill(t.owner)}</div>
+        <div class="todo-title${isDone ? " done-text" : ""}">${t.text}</div>
+        <div class="todo-meta">${whoPill(t.owner, "do")}</div>
       </div>
       <button class="del-btn" onclick="deleteTodo('${t.id}')" aria-label="Delete">✕</button>
     </div>`;
@@ -344,24 +557,24 @@ function renderTodoPanel() {
       <h3>Add task</h3>
       <div class="form-stack">
         <input type="text" id="todo-text" placeholder="What needs doing?" />
-        <select id="todo-owner">${memberOpts}</select>
+        <div>
+          <label class="field-label">Assign to</label>
+          <select id="todo-owner">${memberOpts}</select>
+        </div>
         <button class="btn-primary" onclick="addTodo()">Add task</button>
       </div>
     </div>
 
-    ${myTasks.length ? `
-      <div class="section-label">My tasks — ${currentUser} (${myTasks.length})</div>
-      ${myTasks.map(todoItemHtml).join("")}` : `
-      <div class="section-label">My tasks — ${currentUser}</div>
-      <p class="empty-msg">Nothing on your list 🎉</p>`}
+    <div class="section-label">My tasks (${myPending.length})</div>
+    ${myPending.length ? myPending.map((t) => todoHtml(t, false)).join("") : `<p class="empty-msg">Nothing on your list 🎉</p>`}
 
-    ${otherTasks.length ? `
-      <div class="section-label" style="margin-top:1.25rem;">Rest of the family (${otherTasks.length})</div>
-      ${otherTasks.map(todoItemHtml).join("")}` : ""}
+    ${otherPending.length ? `
+      <div class="section-label" style="margin-top:1.25rem;">Rest of the family (${otherPending.length})</div>
+      ${otherPending.map((t) => todoHtml(t, false)).join("")}` : ""}
 
     ${done.length ? `
       <div class="section-label" style="margin-top:1.25rem;">Completed (${done.length})</div>
-      ${done.map(doneItemHtml).join("")}` : ""}`;
+      ${done.map((t) => todoHtml(t, true)).join("")}` : ""}`;
 
   document.getElementById("todo-text")?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") addTodo();
@@ -369,27 +582,6 @@ function renderTodoPanel() {
 }
 
 // ── Actions ───────────────────────────────────────────────────
-
-function selectUser(name) {
-  currentUser = name;
-  localStorage.setItem("familyhub-user", name);
-  render();
-}
-
-function switchUser() {
-  currentUser = null;
-  localStorage.removeItem("familyhub-user");
-  render();
-}
-
-async function addMember() {
-  const inp = document.getElementById("new-member");
-  const name = inp.value.trim();
-  if (!name || state.members.find((m) => m.name === name)) return;
-  state.members.push({ name, colorIdx: state.members.length });
-  await saveData();
-  renderSetup(document.getElementById("app"));
-}
 
 function changeMonth(dir) {
   curMonth += dir;
@@ -401,12 +593,30 @@ function changeMonth(dir) {
 async function addEvent() {
   const name = document.getElementById("ev-name")?.value.trim();
   const date = document.getElementById("ev-date")?.value;
-  const owner = document.getElementById("ev-owner")?.value;
+  const doer = document.getElementById("ev-doer")?.value;
+  const startTime = document.getElementById("ev-start")?.value || "";
+  const endTime = document.getElementById("ev-end")?.value || "";
   const notes = document.getElementById("ev-notes")?.value.trim() || "";
+  const reminder = document.getElementById("ev-reminder")?.value || "none";
+
+  // Collect checked seers
+  const seerChecks = document.querySelectorAll('input[name="seer"]:checked');
+  const seers = Array.from(seerChecks).map((c) => c.value);
+
+  // Make sure doer is always in seers
+  if (!seers.includes(doer)) seers.push(doer);
+
   if (!name || !date) return;
-  state.events.push({ id: uid(), name, date, owner, notes, addedBy: currentUser });
+
+  state.events.push({
+    id: uid(), name, date, doer, seers,
+    startTime, endTime, notes, reminder,
+    addedBy: currentUser.name,
+  });
+
   await saveData();
   renderCalPanel();
+  checkReminders();
 }
 
 async function deleteEvent(id) {
@@ -419,7 +629,7 @@ async function addTodo() {
   const text = document.getElementById("todo-text")?.value.trim();
   const owner = document.getElementById("todo-owner")?.value;
   if (!text) return;
-  state.todos.push({ id: uid(), text, owner, done: false, addedBy: currentUser });
+  state.todos.push({ id: uid(), text, owner, done: false, addedBy: currentUser.name });
   await saveData();
   renderTodoPanel();
 }
@@ -434,14 +644,6 @@ async function deleteTodo(id) {
   state.todos = state.todos.filter((t) => t.id !== id);
   await saveData();
   renderTodoPanel();
-}
-
-function showTab(name) {
-  activeTab = name;
-  ["cal", "todo"].forEach((n) => {
-    document.getElementById("tab-" + n)?.classList.toggle("active", n === name);
-    document.getElementById("panel-" + n)?.classList.toggle("active", n === name);
-  });
 }
 
 // ── Boot ──────────────────────────────────────────────────────
